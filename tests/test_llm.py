@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from aimcp.config import Settings
-from aimcp.llm import is_retryable_error, remove_thinking_tags
+from aimcp.llm import (
+    EmptyResponseError,
+    _extract_responses_text,
+    is_retryable_error,
+    remove_thinking_tags,
+)
 
 
 def test_remove_thinking_tags_strips_block() -> None:
@@ -30,6 +37,27 @@ def test_is_retryable_error_blocked_is_false() -> None:
 
 def test_is_retryable_error_content_filter_is_false() -> None:
     assert is_retryable_error(Exception("Content filter triggered")) is False
+
+
+def test_is_retryable_error_empty_response_is_false() -> None:
+    assert is_retryable_error(EmptyResponseError("空")) is False
+
+
+def test_extract_responses_text_prefers_output_text() -> None:
+    response = SimpleNamespace(output_text="标准正文", output=[])
+    assert _extract_responses_text(response) == "标准正文"
+
+
+def test_extract_responses_text_falls_back_to_nonstandard_content() -> None:
+    text_part = SimpleNamespace(type="text", text="非标准正文")
+    item = SimpleNamespace(type="message", content=[text_part])
+    response = SimpleNamespace(output_text="", output=[item])
+    assert _extract_responses_text(response) == "非标准正文"
+
+
+def test_extract_responses_text_empty_when_nothing() -> None:
+    response = SimpleNamespace(output_text="", output=[])
+    assert _extract_responses_text(response) == ""
 
 
 def test_normalize_api_format_defaults_to_chat() -> None:

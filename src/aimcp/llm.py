@@ -6,11 +6,14 @@
 
 两种格式都支持 ``reasoning_effort``（思考强度）；与 ``temperature`` 互斥，
 调用失败且错误可重试时，会去掉推理参数、改用 ``temperature`` 再试一次。
+
+当模型返回空内容时，抛出 ``EmptyResponseError`` 并附带原始响应，避免静默返回空串。
 """
 
 from __future__ import annotations
 
 import re
+import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -34,10 +37,17 @@ _BLOCKING_KEYWORDS = (
     "inappropriate",
 )
 
+# 原始响应 dump 的最大长度
+_DUMP_LIMIT = 3000
+
+
+class EmptyResponseError(RuntimeError):
+    """模型返回空内容。单独成类，避免被当成可重试错误而重复计费。"""
+
 
 def is_retryable_error(error: Exception) -> bool:
     """判断错误能否通过降级重试（去掉 reasoning 参数）解决。"""
-    if isinstance(error, NON_RETRYABLE_ERRORS):
+    if isinstance(error, (EmptyResponseError, *NON_RETRYABLE_ERRORS)):
         return False
     message = str(error).lower()
     return not any(keyword in message for keyword in _BLOCKING_KEYWORDS)
@@ -55,6 +65,34 @@ def remove_thinking_tags(text: str) -> str:
     text = re.sub(r"\n\s*\n\s*\n", "\n\n", text)
 
     return text.strip()
+
+
+def _dump(obj: Any) -> str:
+    """把响应对象转成可打印的字符串（用于诊断）。"""
+    try:
+        data = obj.model_dump_json()
+    except Exception:
+        data = repr(obj)
+    return data[:_DUMP_LIMIT]
+
+
+def _extract_responses_text(response: Any) -> str:
+    """从 Responses 响应中提取正文。
+
+    优先用 SDK 的 ``output_text``；若为空，则兜底遍历 ``output`` 手动拼接，
+    以兼容部分网关把 content 类型写成 ``text`` 而非 ``output_text`` 的情况。
+    """
+    text = getattr(response, "output_text", "") or ""
+    if text:
+        return text
+
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        for part in getattr(item, "content", None) or []:
+            piece = getattr(part, "text", None)
+            if isinstance(piece, str) and piece:
+                parts.append(piece)
+    return "".join(parts)
 
 
 class LLMClient:
@@ -94,17 +132,25 @@ class LLMClient:
     ) -> str:
         """发起一次非流式补全，返回去除思考标签后的正文。"""
         if self.api_format == "responses":
-            raw = await self._call_responses(system, user, history)
+            raw, dump = await self._call_responses(system, user, history)
         else:
-            raw = await self._call_chat(system, user, history)
-        return remove_thinking_tags(raw)
+            raw, dump = await self._call_chat(system, user, history)
+
+        text = remove_thinking_tags(raw)
+        if not text.strip():
+            self._report_empty(raw, dump)
+            raise EmptyResponseError(
+                f"模型返回空内容（格式 {self.api_format}，模型 {self.model}）。"
+                f"原始响应: {dump}"
+            )
+        return text
 
     async def _call_chat(
         self,
         system: str,
         user: str,
         history: list[dict[str, str]] | None,
-    ) -> str:
+    ) -> tuple[str, str]:
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user})
@@ -120,9 +166,10 @@ class LLMClient:
         else:
             params["temperature"] = self.temperature
 
-        async def call(p: dict[str, Any]) -> str:
+        async def call(p: dict[str, Any]) -> tuple[str, str]:
             response = await self.client.chat.completions.create(**p)
-            return response.choices[0].message.content or ""
+            content = response.choices[0].message.content or ""
+            return content, _dump(response)
 
         return await self._with_fallback(call, params)
 
@@ -131,7 +178,7 @@ class LLMClient:
         system: str,
         user: str,
         history: list[dict[str, str]] | None,
-    ) -> str:
+    ) -> tuple[str, str]:
         items: list[dict[str, Any]] = list(history or [])
         items.append({"role": "user", "content": user})
 
@@ -146,17 +193,17 @@ class LLMClient:
         else:
             params["temperature"] = self.temperature
 
-        async def call(p: dict[str, Any]) -> str:
+        async def call(p: dict[str, Any]) -> tuple[str, str]:
             response = await self.client.responses.create(**p)
-            return response.output_text or ""
+            return _extract_responses_text(response), _dump(response)
 
         return await self._with_fallback(call, params)
 
     async def _with_fallback(
         self,
-        call: Callable[[dict[str, Any]], Awaitable[str]],
+        call: Callable[[dict[str, Any]], Awaitable[tuple[str, str]]],
         params: dict[str, Any],
-    ) -> str:
+    ) -> tuple[str, str]:
         """执行调用；推理参数导致失败时降级重试一次。"""
         try:
             return await call(params)
@@ -173,3 +220,18 @@ class LLMClient:
                     "可能原因：内容触发安全过滤 / API Key 权限不足 / 代理服务配置问题。"
                 ) from error
             raise
+
+    def _report_empty(self, raw: str, dump: str) -> None:
+        """把空响应详情打到 stderr（服务端日志可见）。"""
+        lines = [
+            "",
+            "=" * 80,
+            "[EMPTY RESPONSE] 模型未返回可用正文",
+            f"[EMPTY RESPONSE] format={self.api_format} model={self.model}",
+            f"[EMPTY RESPONSE] use_reasoning={self.use_reasoning} effort={self.reasoning_effort}",
+            f"[EMPTY RESPONSE] raw_text={raw!r}",
+            f"[EMPTY RESPONSE] response_dump={dump}",
+            "=" * 80,
+            "",
+        ]
+        print("\n".join(lines), file=sys.stderr, flush=True)
