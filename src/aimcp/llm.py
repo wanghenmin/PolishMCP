@@ -4,6 +4,9 @@
 - ``chat``：``/v1/chat/completions``（默认）
 - ``responses``：``/v1/responses``（OpenAI Responses API）
 
+支持流式与非流式：部分网关在非流式下不回填正文（例如 responses 的 ``output`` 为空数组），
+改用流式即可正常拿到内容，通过 ``LLM_STREAM=true`` 开启。
+
 两种格式都支持 ``reasoning_effort``（思考强度）；与 ``temperature`` 互斥，
 调用失败且错误可重试时，会去掉推理参数、改用 ``temperature`` 再试一次。
 
@@ -96,7 +99,7 @@ def _extract_responses_text(response: Any) -> str:
 
 
 class LLMClient:
-    """封装单次对话补全调用，支持 chat / responses 两种格式。"""
+    """封装单次对话补全调用，支持 chat / responses 两种格式与流式/非流式。"""
 
     def __init__(
         self,
@@ -107,11 +110,13 @@ class LLMClient:
         temperature: float = 0.7,
         timeout_s: float = 60,
         reasoning_effort: str | None = None,
+        stream: bool = False,
     ) -> None:
         self.model = model
         self.api_format = api_format
         self.temperature = temperature
         self.reasoning_effort = reasoning_effort
+        self.stream = stream
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url.rstrip("/"),
@@ -130,27 +135,32 @@ class LLMClient:
         user: str,
         history: list[dict[str, str]] | None = None,
     ) -> str:
-        """发起一次非流式补全，返回去除思考标签后的正文。"""
+        """发起一次补全，返回去除思考标签后的正文。"""
         if self.api_format == "responses":
-            raw, dump = await self._call_responses(system, user, history)
+            runner = self._call_responses_stream if self.stream else self._call_responses
         else:
-            raw, dump = await self._call_chat(system, user, history)
+            runner = self._call_chat_stream if self.stream else self._call_chat
+
+        raw, dump = await runner(system, user, history)
 
         text = remove_thinking_tags(raw)
         if not text.strip():
             self._report_empty(raw, dump)
             raise EmptyResponseError(
                 f"模型返回空内容（格式 {self.api_format}，模型 {self.model}）。"
+                f"若为非流式且网关未回填正文，可尝试设置 LLM_STREAM=true 走流式。"
                 f"原始响应: {dump}"
             )
         return text
 
-    async def _call_chat(
+    def _chat_params(
         self,
         system: str,
         user: str,
         history: list[dict[str, str]] | None,
-    ) -> tuple[str, str]:
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user})
@@ -158,18 +168,68 @@ class LLMClient:
         params: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "stream": False,
+            "stream": stream,
         }
         if self.use_reasoning:
             # 用 extra_body 透传，兼容旧版 SDK 与第三方网关
             params["extra_body"] = {"reasoning_effort": self.reasoning_effort}
         else:
             params["temperature"] = self.temperature
+        return params
+
+    def _responses_params(
+        self,
+        system: str,
+        user: str,
+        history: list[dict[str, str]] | None,
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        items: list[dict[str, Any]] = list(history or [])
+        items.append({"role": "user", "content": user})
+
+        params: dict[str, Any] = {
+            "model": self.model,
+            "instructions": system,
+            "input": items,
+            "stream": stream,
+        }
+        if self.use_reasoning:
+            params["reasoning"] = {"effort": self.reasoning_effort}
+        else:
+            params["temperature"] = self.temperature
+        return params
+
+    async def _call_chat(
+        self,
+        system: str,
+        user: str,
+        history: list[dict[str, str]] | None,
+    ) -> tuple[str, str]:
+        params = self._chat_params(system, user, history, stream=False)
 
         async def call(p: dict[str, Any]) -> tuple[str, str]:
             response = await self.client.chat.completions.create(**p)
             content = response.choices[0].message.content or ""
             return content, _dump(response)
+
+        return await self._with_fallback(call, params)
+
+    async def _call_chat_stream(
+        self,
+        system: str,
+        user: str,
+        history: list[dict[str, str]] | None,
+    ) -> tuple[str, str]:
+        params = self._chat_params(system, user, history, stream=True)
+
+        async def call(p: dict[str, Any]) -> tuple[str, str]:
+            stream = await self.client.chat.completions.create(**p)
+            parts: list[str] = []
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    parts.append(chunk.choices[0].delta.content)
+            return "".join(parts), f"<streamed {len(parts)} chunks>"
 
         return await self._with_fallback(call, params)
 
@@ -179,23 +239,35 @@ class LLMClient:
         user: str,
         history: list[dict[str, str]] | None,
     ) -> tuple[str, str]:
-        items: list[dict[str, Any]] = list(history or [])
-        items.append({"role": "user", "content": user})
-
-        params: dict[str, Any] = {
-            "model": self.model,
-            "instructions": system,
-            "input": items,
-            "stream": False,
-        }
-        if self.use_reasoning:
-            params["reasoning"] = {"effort": self.reasoning_effort}
-        else:
-            params["temperature"] = self.temperature
+        params = self._responses_params(system, user, history, stream=False)
 
         async def call(p: dict[str, Any]) -> tuple[str, str]:
             response = await self.client.responses.create(**p)
             return _extract_responses_text(response), _dump(response)
+
+        return await self._with_fallback(call, params)
+
+    async def _call_responses_stream(
+        self,
+        system: str,
+        user: str,
+        history: list[dict[str, str]] | None,
+    ) -> tuple[str, str]:
+        params = self._responses_params(system, user, history, stream=True)
+
+        async def call(p: dict[str, Any]) -> tuple[str, str]:
+            stream = await self.client.responses.create(**p)
+            parts: list[str] = []
+            dump = "<streaming>"
+            async for event in stream:
+                event_type = getattr(event, "type", None)
+                if event_type == "response.output_text.delta":
+                    parts.append(getattr(event, "delta", "") or "")
+                elif event_type == "response.completed":
+                    final = getattr(event, "response", None)
+                    if final is not None:
+                        dump = _dump(final)
+            return "".join(parts), dump
 
         return await self._with_fallback(call, params)
 
@@ -228,7 +300,7 @@ class LLMClient:
             "=" * 80,
             "[EMPTY RESPONSE] 模型未返回可用正文",
             f"[EMPTY RESPONSE] format={self.api_format} model={self.model}",
-            f"[EMPTY RESPONSE] use_reasoning={self.use_reasoning} effort={self.reasoning_effort}",
+            f"[EMPTY RESPONSE] stream={self.stream} use_reasoning={self.use_reasoning}",
             f"[EMPTY RESPONSE] raw_text={raw!r}",
             f"[EMPTY RESPONSE] response_dump={dump}",
             "=" * 80,

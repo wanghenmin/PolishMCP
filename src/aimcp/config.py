@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_S: float = 60
     # 接口格式：chat（/v1/chat/completions）| responses（/v1/responses）
     LLM_API_FORMAT: str = "chat"
+    # 流式输出：部分网关非流式不回填正文，需开启流式
+    LLM_STREAM: bool = False
     # 思考模式：开启后走 reasoning_effort（与 temperature 互斥）
     THINKING_MODE_ENABLED: bool = False
     THINKING_MODE_EFFORT: str = "high"

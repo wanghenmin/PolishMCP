@@ -34,6 +34,7 @@ class Processor:
                 temperature=self.settings.LLM_TEMPERATURE,
                 timeout_s=self.settings.LLM_TIMEOUT_S,
                 reasoning_effort=self.settings.reasoning_effort,
+                stream=self.settings.LLM_STREAM,
             )
         return self._clients[stage]
 

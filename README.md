@@ -35,6 +35,7 @@ cp .env.example .env      # 填入 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
 | `LLM_MODEL` | 默认模型 | `gemini-2.5-pro` |
 | `POLISH_MODEL` / `ENHANCE_MODEL` / `EMOTION_MODEL` | 分阶段覆盖模型（可选） | 回退 `LLM_MODEL` |
 | `LLM_API_FORMAT` | 接口格式：`chat` 或 `responses` | `chat` |
+| `LLM_STREAM` | 流式输出（部分网关非流式不回填正文，需开启） | `false` |
 | `THINKING_MODE_ENABLED` | 启用思考模式（走 `reasoning_effort`，与 temperature 互斥） | `false` |
 | `THINKING_MODE_EFFORT` | 思考强度 | `high` |
 | `SEGMENT_MAX_CHARS` | 单段最大长度（汉字/字母数） | `800` |
@@ -57,6 +58,17 @@ cp .env.example .env      # 填入 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
 
 开启 `THINKING_MODE_ENABLED` 后，优先用推理参数（与 `temperature` 互斥）；
 若调用失败且错误可重试，会自动降级为 `temperature` 重试一次。
+
+### 流式输出（LLM_STREAM）
+
+部分网关在**非流式**模式下不回填正文（典型表现：responses 响应 `status=completed`
+但 `output` 为空数组，usage 里却能看到输出 token）。此时开启流式即可正常拿到内容：
+
+```properties
+LLM_STREAM=true
+```
+
+`chat` 与 `responses` 两种格式都支持流式，工具会在服务端累积 delta 后返回完整文本。
 
 ## 运行
 

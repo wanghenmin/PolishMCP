@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from aimcp.config import Settings
 from aimcp.llm import (
     EmptyResponseError,
+    LLMClient,
     _extract_responses_text,
     is_retryable_error,
     remove_thinking_tags,
@@ -75,3 +77,63 @@ def test_reasoning_effort_respects_toggle() -> None:
     on = Settings(LLM_API_KEY="x", THINKING_MODE_ENABLED=True, THINKING_MODE_EFFORT="medium")
     assert off.reasoning_effort is None
     assert on.reasoning_effort == "medium"
+
+
+class _FakeResponsesStream:
+    def __init__(self) -> None:
+        self.params: dict = {}
+
+    async def create(self, **params):
+        self.params = params
+
+        async def gen():
+            yield SimpleNamespace(type="response.created")
+            for char in "你好":
+                yield SimpleNamespace(type="response.output_text.delta", delta=char)
+            yield SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(model_dump_json=lambda: "{}"),
+            )
+
+        return gen()
+
+
+class _FakeChatStream:
+    def __init__(self) -> None:
+        self.params: dict = {}
+
+    async def create(self, **params):
+        self.params = params
+
+        async def gen():
+            for char in "你好":
+                delta = SimpleNamespace(content=char)
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+
+        return gen()
+
+
+def _client(api_format: str, resource) -> LLMClient:
+    client = LLMClient(
+        model="m", api_key="k", base_url="http://h/v1", api_format=api_format, stream=True
+    )
+    chat = SimpleNamespace(completions=resource if api_format == "chat" else None)
+    responses = resource if api_format == "responses" else None
+    client.client = SimpleNamespace(chat=chat, responses=responses)  # type: ignore[assignment]
+    return client
+
+
+def test_responses_stream_accumulates_deltas() -> None:
+    fake = _FakeResponsesStream()
+    client = _client("responses", fake)
+    out = asyncio.run(client.complete("SYS", "USER"))
+    assert out == "你好"
+    assert fake.params["stream"] is True
+
+
+def test_chat_stream_accumulates_chunks() -> None:
+    fake = _FakeChatStream()
+    client = _client("chat", fake)
+    out = asyncio.run(client.complete("SYS", "USER"))
+    assert out == "你好"
+    assert fake.params["stream"] is True
