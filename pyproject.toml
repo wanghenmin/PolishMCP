@@ -1,0 +1,43 @@
+[project]
+name = "aimcp"
+version = "0.1.0"
+description = "文本润色 / 去 AI 痕迹 MCP Server"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.28.0,<2",
+    "openai>=1.0.0",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+aimcp = "aimcp.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.26.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aimcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# 提示词为逐字提取的长文本，不受行长限制
+"src/aimcp/prompts.py" = ["E501"]
